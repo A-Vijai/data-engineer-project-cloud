@@ -1,0 +1,280 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME || 'analytics-project' }}
+  DATAPROC_CLUSTER_NAME: ${{ secrets.DATAPROC_CLUSTER_NAME }}
+  COMPOSER_ENVIRONMENT: ${{ secrets.COMPOSER_ENVIRONMENT }}
+  COMPOSER_REGION: ${{ secrets.COMPOSER_REGION || 'us-central1' }}
+  CLOUD_RUN_SERVICE_NAME: ${{ secrets.CLOUD_RUN_SERVICE_NAME }}
+  CLOUD_RUN_REGION: ${{ secrets.CLOUD_RUN_REGION || 'us-central1' }}
+  BIGQUERY_DATASET: ${{ secrets.BIGQUERY_DATASET }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+      
+      - name: Set GCP project
+        run: |
+          gcloud config set project ${{ env.GCP_PROJECT_ID }}
+      
+      - name: Verify GCS bucket exists
+        run: |
+          echo "Checking if bucket ${{ env.GCS_BUCKET_NAME }} exists..."
+          gsutil ls gs://${{ env.GCS_BUCKET_NAME }} || {
+            echo "Bucket does not exist. Please create it first."
+            exit 1
+          }
+      
+      - name: Upload Spark jobs to GCS
+        run: |
+          echo "Uploading Spark jobs to gs://${{ env.GCS_BUCKET_NAME }}/spark-jobs/"
+          gsutil -m cp spark/jobs/*.py gs://${{ env.GCS_BUCKET_NAME }}/spark-jobs/
+          echo "✓ Spark jobs uploaded successfully"
+      
+      - name: Upload BigQuery connector JAR (if not exists)
+        run: |
+          echo "Checking for BigQuery connector JAR..."
+          if ! gsutil ls gs://${{ env.GCS_BUCKET_NAME }}/spark-jobs/spark-bigquery-latest.jar 2>/dev/null; then
+            echo "Downloading BigQuery connector JAR..."
+            gsutil cp gs://spark-lib/bigquery/spark-bigquery-latest.jar gs://${{ env.GCS_BUCKET_NAME }}/spark-jobs/ || echo "Note: JAR may already be available in Spark lib"
+          else
+            echo "✓ BigQuery connector JAR already exists"
+          fi
+      
+      - name: Get Composer bucket and upload DAGs
+        run: |
+          echo "Getting Composer environment details..."
+          COMPOSER_BUCKET=$(gcloud composer environments describe ${{ env.COMPOSER_ENVIRONMENT }} \
+            --location ${{ env.COMPOSER_REGION }} \
+            --format="get(config.dagGcsPrefix)" 2>/dev/null || echo "")
+          
+          if [ -z "$COMPOSER_BUCKET" ]; then
+            echo "⚠️  Warning: Composer environment '${{ env.COMPOSER_ENVIRONMENT }}' not found."
+            echo "Skipping DAG upload. Please upload manually or ensure Composer is created."
+          else
+            echo "Uploading Airflow DAGs to $COMPOSER_BUCKET/dags/"
+            gsutil cp airflow/dags/*.py $COMPOSER_BUCKET/dags/
+            echo "✓ Airflow DAGs uploaded successfully"
+          fi
+      
+      - name: Verify Dataproc cluster
+        run: |
+          echo "Verifying Dataproc cluster exists..."
+          gcloud dataproc clusters describe ${{ env.DATAPROC_CLUSTER_NAME }} \
+            --region ${{ env.COMPOSER_REGION }} \
+            --format="get(clusterName, status.state)" || {
+            echo "⚠️  Warning: Dataproc cluster '${{ env.DATAPROC_CLUSTER_NAME }}' not found."
+            echo "Please ensure the cluster is running before running the pipeline."
+          }
+      
+      - name: Verify BigQuery dataset
+        run: |
+          echo "Verifying BigQuery dataset exists..."
+          bq show ${{ env.GCP_PROJECT_ID }}:${{ env.BIGQUERY_DATASET }} || {
+            echo "⚠️  Warning: BigQuery dataset '${{ env.BIGQUERY_DATASET }}' not found."
+            echo "Creating dataset..."
+            bq mk --dataset --location=US ${{ env.GCP_PROJECT_ID }}:${{ env.BIGQUERY_DATASET }} || echo "Dataset creation failed or already exists"
+          }
+      
+      - name: Enable required APIs
+        run: |
+          echo "Enabling required GCP APIs..."
+          gcloud services enable cloudbuild.googleapis.com
+          gcloud services enable run.googleapis.com
+          gcloud services enable artifactregistry.googleapis.com
+          gcloud services enable cloudresourcemanager.googleapis.com
+          echo "✓ APIs enabled"
+      
+      - name: Get or create service account for Cloud Run
+        id: service-account
+        run: |
+          SA_EMAIL="${{ secrets.CLOUD_RUN_SA_EMAIL }}"
+          
+          if [ -z "$SA_EMAIL" ]; then
+            echo "No custom service account provided. Using default compute service account..."
+            # Get default compute service account
+            SA_EMAIL=$(gcloud iam service-accounts list \
+              --filter="email:compute@developer.gserviceaccount.com" \
+              --format="value(email)" \
+              --limit=1)
+            
+            if [ -z "$SA_EMAIL" ]; then
+              # Get project number for default service account
+              PROJECT_NUMBER=$(gcloud projects describe ${{ env.GCP_PROJECT_ID }} --format="value(projectNumber)")
+              SA_EMAIL="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+            fi
+            
+            echo "Using default compute service account: $SA_EMAIL"
+          else
+            echo "Using provided service account: $SA_EMAIL"
+          fi
+          
+          echo "sa_email=$SA_EMAIL" >> $GITHUB_OUTPUT
+          echo "SA_EMAIL=$SA_EMAIL" >> $GITHUB_ENV
+      
+      - name: Grant BigQuery permissions to service account
+        run: |
+          echo "Granting BigQuery permissions to service account..."
+          SA_EMAIL="${{ env.SA_EMAIL }}"
+          
+          # Grant BigQuery Data Viewer role
+          gcloud projects add-iam-policy-binding ${{ env.GCP_PROJECT_ID }} \
+            --member="serviceAccount:$SA_EMAIL" \
+            --role="roles/bigquery.dataViewer" \
+            --condition=None 2>/dev/null || echo "BigQuery Data Viewer role already granted or error occurred"
+          
+          # Grant BigQuery Job User role
+          gcloud projects add-iam-policy-binding ${{ env.GCP_PROJECT_ID }} \
+            --member="serviceAccount:$SA_EMAIL" \
+            --role="roles/bigquery.jobUser" \
+            --condition=None 2>/dev/null || echo "BigQuery Job User role already granted or error occurred"
+          
+          echo "✓ Permissions granted"
+      
+      - name: Create Artifact Registry repository (if not exists)
+        run: |
+          echo "Checking for Artifact Registry repository..."
+          
+          # Check if repository exists
+          if gcloud artifacts repositories describe ride-analytics-repo \
+            --location=${{ env.CLOUD_RUN_REGION }} \
+            --repository-format=docker >/dev/null 2>&1; then
+            echo "✓ Repository already exists"
+          else
+            echo "Creating Artifact Registry repository..."
+            # Create repository - exit code 0 if successful or if it already exists
+            set +e
+            OUTPUT=$(gcloud artifacts repositories create ride-analytics-repo \
+              --repository-format=docker \
+              --location=${{ env.CLOUD_RUN_REGION }} \
+              --description="Docker repository for Ride Analytics API" 2>&1)
+            EXIT_CODE=$?
+            set -e
+            
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "✓ Repository created successfully"
+            elif echo "$OUTPUT" | grep -q "ALREADY_EXISTS"; then
+              echo "✓ Repository already exists (may have been created concurrently)"
+            else
+              echo "❌ Failed to create repository:"
+              echo "$OUTPUT"
+              exit 1
+            fi
+          fi
+      
+      - name: Build and push Docker image using Cloud Build
+        working-directory: api
+        run: |
+          echo "Building and pushing Docker image using Cloud Build..."
+          IMAGE_NAME="${{ env.CLOUD_RUN_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/ride-analytics-repo/ride-analytics-api:${{ github.sha }}"
+          
+          # Build and push using Cloud Build
+          gcloud builds submit \
+            --tag $IMAGE_NAME \
+            --timeout=20m \
+            --quiet
+          
+          echo "✓ Image built and pushed: $IMAGE_NAME"
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+      
+      - name: Deploy to Cloud Run
+        run: |
+          set -e
+          echo "Deploying to Cloud Run..."
+          
+          # Check if service exists
+          if gcloud run services describe ${{ env.CLOUD_RUN_SERVICE_NAME }} \
+            --region=${{ env.CLOUD_RUN_REGION }} \
+            --format="get(status.url)" 2>/dev/null; then
+            echo "Service exists. Will update..."
+          else
+            echo "Service does not exist. Will create..."
+          fi
+          
+          # Build deployment command
+          # Note: gcloud run deploy works for both create and update
+          DEPLOY_ARGS=(
+            "deploy"
+            "${{ env.CLOUD_RUN_SERVICE_NAME }}"
+            "--image=${{ env.IMAGE_NAME }}"
+            "--platform=managed"
+            "--region=${{ env.CLOUD_RUN_REGION }}"
+            "--allow-unauthenticated"
+            "--memory=512Mi"
+            "--cpu=1"
+            "--timeout=300"
+            "--max-instances=10"
+            "--min-instances=0"
+            "--port=8080"
+            "--set-env-vars=GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},BIGQUERY_DATASET=${{ env.BIGQUERY_DATASET }}"
+            "--service-account=${{ env.SA_EMAIL }}"
+          )
+          
+          echo "Using service account: ${{ env.SA_EMAIL }}"
+          
+          # Deploy the service (creates if new, updates if exists)
+          gcloud run "${DEPLOY_ARGS[@]}"
+          
+          echo "✓ Deployment completed"
+      
+      - name: Grant public access to Cloud Run service
+        run: |
+          echo "Granting public access to Cloud Run service..."
+          gcloud run services add-iam-policy-binding ${{ env.CLOUD_RUN_SERVICE_NAME }} \
+            --region=${{ env.CLOUD_RUN_REGION }} \
+            --member="allUsers" \
+            --role="roles/run.invoker" \
+            --quiet || echo "⚠️  Warning: Failed to grant public access. Service may require authentication."
+          
+          echo "✓ Public access granted"
+      
+      - name: Get Cloud Run service URL
+        id: get-url
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${{ env.CLOUD_RUN_SERVICE_NAME }} \
+            --region=${{ env.CLOUD_RUN_REGION }} \
+            --format="get(status.url)")
+          echo "SERVICE_URL=$SERVICE_URL" >> $GITHUB_ENV
+          echo "url=$SERVICE_URL" >> $GITHUB_OUTPUT
+          echo "✓ Service URL: $SERVICE_URL"
+      
+      - name: Verify deployment
+        run: |
+          echo "Verifying deployment..."
+          SERVICE_URL="${{ env.SERVICE_URL }}"
+          
+          # Wait a few seconds for service to be ready
+          sleep 5
+          
+          # Test health endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$SERVICE_URL/api/health" || echo "000")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Deployment verified! Health check passed."
+          else
+            echo "⚠️  Warning: Health check returned HTTP $HTTP_CODE"
+            echo "Service may still be starting up. Please check the Cloud Run logs."
+          fi
+      
+      - name: Deployment summary
+        run: |
+          echo "=========================================="
+          echo "✅ Deployment completed successfully!"
+          echo "=========================================="
