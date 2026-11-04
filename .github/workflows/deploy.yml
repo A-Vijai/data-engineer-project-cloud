@@ -191,6 +191,7 @@ jobs:
           gcloud builds submit \
             --tag $IMAGE_NAME \
             --timeout=20m \
+            --suppress-logs \
             --quiet
           
           echo "✓ Image built and pushed: $IMAGE_NAME"
