@@ -190,6 +190,7 @@ jobs:
           # Build and push using Cloud Build
           gcloud builds submit \
             --tag $IMAGE_NAME \
+            --service-account="projects/{{ env.GCP_PROJECT_ID }}/serviceAccounts/env.SA_EMAIL"
             --timeout=20m \
             --quiet
           
