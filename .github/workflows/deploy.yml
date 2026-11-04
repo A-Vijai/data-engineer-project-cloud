@@ -6,7 +6,7 @@ on:
   workflow_dispatch:  # Allow manual trigger
 
 env:
-  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }} 
   GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME || 'analytics-project-ai' }}
   DATAPROC_CLUSTER_NAME: ${{ secrets.DATAPROC_CLUSTER_NAME }}
   COMPOSER_ENVIRONMENT: ${{ secrets.COMPOSER_ENVIRONMENT }}
